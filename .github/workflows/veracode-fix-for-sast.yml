@@ -1,0 +1,124 @@
+name: Veracode Fix for SAST
+
+run-name: Veracode Fix for SAST - ${{ github.event.client_payload.workflow_name }}
+
+on:
+  repository_dispatch:
+    types:
+      - veracode-fix-for-sast
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    uses: ./.github/workflows/veracode-clean-up.yml
+    with:
+      runs_on: ${{ github.event.client_payload.user_config.default_runs_on }}
+
+  create_metadata:
+    needs: cleanup
+    uses: ./.github/workflows/veracode-metadata.yml
+    with:
+      event_type: ${{ github.event.client_payload.event_type }}
+      repository_name: ${{ github.event.client_payload.repository.name }}
+      repository_owner: ${{ github.event.client_payload.repository.owner }}
+      pull_request_num: ${{ github.event.client_payload.issue_number }}
+      branch: ${{ github.event.client_payload.repository.branch }}
+      head_sha: ${{ github.event.client_payload.sha }}
+      fix_sast_params: ${{ github.event.client_payload.fix_sast_params }}
+
+  fix-for-sast-action:
+    needs: create_metadata
+    runs-on: ${{ fromJSON(github.event.client_payload.user_config.default_runs_on) }}
+    steps:
+      - name: Install git-lfs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-lfs
+          git lfs install
+
+      # The fix_id-enriched results.json is stored by veracode-github-app as a git blob in
+      # this repo and passed as `results-blob-sha` below. The veracode-fix-for-sca action
+      # fetches that blob and writes veracode_artifact_directory/results.json itself, so no
+      # decode step is needed here (client_payload can't carry the full base64 - it exceeds
+      # GitHub's ~64 KB dispatch limit).
+
+      - name: Check out to get veracode CLI
+        uses: actions/checkout@v6
+        with:
+          path: 'veracode-helper'
+          lfs: true
+          fetch-depth: 0
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            helper/cli/*
+
+      - name: Set up CLI (Linux/macOS)
+        id: cli-setup-unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cd veracode-helper/helper/cli
+          cliFile=$(ls -1 *.tar.gz 2>/dev/null | head -n 1)
+          if [[ -z "$cliFile" ]]; then
+            echo "Error: No .tar.gz file found in helper/cli directory"
+            ls -la
+            exit 1
+          fi
+          echo "Found CLI file: $cliFile"
+          file "$cliFile"
+          tar -zxvf "$cliFile"
+          cliPath=$(find . -type f -name "veracode" -print -quit)
+          if [[ -z "$cliPath" ]]; then
+            echo "Error: veracode was not found in the extracted archive"
+            exit 1
+          fi
+          cliPath=$(dirname "$cliPath")
+          cd "$cliPath"
+          current_path=$(pwd)
+          echo "cli-path=$current_path" >> $GITHUB_OUTPUT
+
+      - name: Set up CLI (Windows)
+        id: cli-setup-windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd veracode-helper/helper/cli
+          $zipFile = Get-ChildItem -Filter "veracode-cli_*.zip" | Select-Object -First 1 -ExpandProperty FullName
+          Expand-Archive -Path $zipFile -DestinationPath . -Force
+          $cliExe = Get-ChildItem -Filter "veracode.exe" -Recurse | Select-Object -First 1
+          $cliPath = $cliExe.DirectoryName
+          echo "cli-path=$cliPath" >> $env:GITHUB_OUTPUT
+
+      - name: Configure git for LF line endings (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git config --global core.eol lf
+          git config --global core.autocrlf false
+
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.client_payload.repository.full_name }}
+          ref: ${{ github.event.client_payload.repository.branch }}
+          token: ${{ github.event.client_payload.token }}
+          path: 'source-code'
+
+      - id: run-fix-sast
+        uses: veracode/veracode-fix-for-sca@feature/sast-workflow
+        env:
+          VERACODE_API_KEY_ID: '${{ secrets.VERACODE_API_ID }}'
+          VERACODE_API_KEY_SECRET: '${{ secrets.VERACODE_API_KEY }}'
+          CLI_PATH: ${{ runner.os == 'Windows' && steps.cli-setup-windows.outputs.cli-path || steps.cli-setup-unix.outputs.cli-path }}
+          FIX_SAST_BACKEND_URL: 'api-agora-stage-107.stage.veracode.io'
+        with:
+          github-token: ${{ github.event.client_payload.token }}
+          pr-number: ${{ github.event.client_payload.issue_number }}
+          sca-scan-run-id: ${{ github.event.client_payload.workflow_run_id }}
+          sca-scan-artifact-id: ${{ github.event.client_payload.artifact_id }}
+          fix-remote: 'true'
+          repository: ${{ github.event.client_payload.repository.full_name }}
+          branch: ${{ github.event.client_payload.repository.branch }}
+          fix-sca-params: ${{ github.event.client_payload.fix_sast_params }}
+          fix-sast-params: ${{ github.event.client_payload.fix_sast_params }}
+          results-blob-sha: ${{ github.event.client_payload.results_blob_sha }}
+          github-api-url: ${{ github.api_url }}
